@@ -8,6 +8,7 @@
 #include "pico/cyw43_arch.h"        // Biblioteca para arquitetura Wi-Fi da Pico com CYW43
 #include "pico/unique_id.h"         // Biblioteca com recursos para trabalhar com os pinos GPIO do Raspberry Pi Pico
 #include "pico/bootrom.h"           // Biblioteca com recursos para trabalhar com o bootrom da Raspberry Pi Pico
+#include "pico/multicore.h"         // Biblioteca para suporte a múltiplos núcleos na Raspberry Pi Pico
 
 #include "FreeRTOS.h"               // Biblioteca de FreeRTOS
 #include "task.h"                   // Biblioteca de tasks
@@ -21,8 +22,8 @@
 #include "bmp280.h"                 // Biblioteca para o sensor BMP280 (Pressão e Temperatura)
 
 //-------------------------------------------Definições-------------------------------------------
-#define WIFI_SSID "XXXXXXXX"                    // Nome da rede Wi-Fi
-#define WIFI_PASS "XXXXXXXXX"                   // Senha da rede Wi-Fi
+#define WIFI_SSID ""                            // Nome da rede Wi-Fi
+#define WIFI_PASS ""                            // Senha da rede Wi-Fi
 
 #define I2C_PORT_BMP i2c0                       // i2c0 pinos 0 e 1
 #define I2C_SDA_BMP 0                           // SDA do BMP280
@@ -37,8 +38,7 @@ struct bmp280_calib_param params;               // Estrutura para armazenar os p
 #define I2C_ADDR_AHT 0x38                       // Endereço do AHT10 (Sensor de Temperatura e Umidade)
 
 #define DEBOUNCE_MS 500                         // Tempo de debounce para os botões     
-
-#define BOTAO_A 5                               // Pino do botão A (GPIO 5)
+                               // Pino do botão A (GPIO 5)
 #define BOTAO_B 6                               // Pino do botão B (BOOTSEL)
 #define LED_BLUE 12                             // Pino do LED Azul
 
@@ -143,22 +143,27 @@ void vLeituraSensoresTask(void *pvParameters)
         double altitude = calculate_altitude(pressure);
 
         // Exibe os dados do BMP 280 no console
-        printf("Pressao = %.3f kPa\n", pressure / 1000.0);
-        printf("Temperatura BMP: = %.2f C\n", temperature / 100.0);
-        printf("Altitude estimada: %.2f m\n", altitude);
+        printf("Core 0: Pressao = %.3f kPa\n", pressure / 1000.0);
+        printf("Core 0: Temperatura BMP: = %.2f C\n", temperature / 100.0);
+        printf("Core 0: Altitude estimada: %.2f m\n", altitude);
 
         // Leitura do AHT20
         if (aht20_read(I2C_PORT_AHT, &data))
         {
             // Exibe os dados do AHT20 no console
-            printf("Temperatura AHT: %.2f C\n", data.temperature);
-            printf("Umidade: %.2f %%\n\n\n", data.humidity);
+            printf("Core 0: Temperatura AHT: %.2f C\n", data.temperature);
+            printf("Core 0: Umidade: %.2f %%\n\n\n", data.humidity);
         }
         else
         {
-            printf("Erro na leitura do AHT10!\n\n\n");
+            printf("Core 0: Erro na leitura do AHT10!\n\n\n");
         }
 
+        multicore_fifo_push_blocking(&temperature, sizeof(temperature));            // Envia temperatura do BMP280 para o outro núcleo
+        multicore_fifo_push_blocking(&altitude, sizeof(altitude));                  // Envia altitude para o outro núcleo
+        multicore_fifo_push_blocking(&data.temperature, sizeof(data.temperature));  // Envia temperatura para o outro núcleo
+        multicore_fifo_push_blocking(&data.humidity, sizeof(data.humidity));        // Envia umidade para o outro núcleo
+        printf("Core 0: Dados enviados para o núcleo 1\n");
 
         sprintf(str_tmp1, "%.1fC", temperature / 100.0);    // Variável para armazenar a temperatura do BMP280
         sprintf(str_alt, "%.0fm", altitude);                // Variável para armazenar a altitude
@@ -166,18 +171,6 @@ void vLeituraSensoresTask(void *pvParameters)
         sprintf(str_umi, "%.1f%%", data.humidity);          // Variável para armazenar a umidade
 
         vTaskDelay(pdMS_TO_TICKS(1000)); // Aguarda 1 segundo antes de repetir
-    }
-}
-
-// Task para piscar o LED Azul
-void vLEDsRGBTask()
-{ 
-    while (true)
-    {
-        gpio_put(LED_BLUE, 1);          // Liga o LED Azul
-        vTaskDelay(pdMS_TO_TICKS(500)); // Aguarda 500 ms
-        gpio_put(LED_BLUE, 0);          // Desliga o LED Azul
-        vTaskDelay(pdMS_TO_TICKS(500)); // Aguarda 500 ms
     }
 }
 
@@ -199,6 +192,7 @@ int main()
     // Verifica se o Wi-Fi está conectado
     if (cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PASS, CYW43_AUTH_WPA2_AES_PSK, 10000))
     {
+        printf("Falha na conexao Wi-Fi\n");
         return 1;
     }
 
@@ -212,10 +206,14 @@ int main()
 
     start_http_server();            // Inicia o servidor HTTP
 
+    // Inicia o segundo núcleo para lidar com a leitura dos sensores
+    // Inserir o nome da função que será executada no segundo núcleo no parenteses abaixo
+    // Utilizar a FIFO para comunicação entre os núcleos (Task dos sensores)
+    //multicore_launch_core1();
+
     // Tasks
     xTaskCreate(vPollingTask, "Polling Task", 256, NULL, 1, NULL);
     xTaskCreate(vLeituraSensoresTask, "Leitura Sensores Task", 256, NULL, 1, NULL);
-    xTaskCreate(vLEDsRGBTask, "LEDs RGB Task", 256, NULL, 1, NULL);
 
     vTaskStartScheduler();          // Inicia o escalonador do FreeRTOS
     panic_unsupported();            // Se o escalonador falhar, entra em pânico
@@ -271,11 +269,11 @@ void gpio_irq_handler(uint gpio, uint32_t events)
 
     if (now - lastIrqTime < DEBOUNCE_MS)
         return; // Debounce
-    lastIrqTime = now;                      // Atualiza o tempo da última interrupção
+    lastIrqTime = now;          // Atualiza o tempo da última interrupção
 
-    if (gpio == BOTAO_B)   // Se o botão B for pressionado
+    if (gpio == BOTAO_B)        // Se o botão B for pressionado
     {
-        reset_usb_boot(0, 0); // Reinicia o dispositivo em modo BOOTSEL
+        reset_usb_boot(0, 0);   // Reinicia o dispositivo em modo BOOTSEL
     }
 }
 
@@ -382,7 +380,7 @@ static err_t http_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t er
     tcp_arg(tpcb, hs);
     tcp_sent(tpcb, http_sent);
 
-    // inicia envio por fatias
+    // Inicia envio por chunks
     send_next_chunk(tpcb, hs);
 
     pbuf_free(p);
